@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Build the x86 VM recovery kernel and initramfs from a signed Omarchy ISO."""
+
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+
+PROJECT = Path(__file__).resolve().parents[1]
+BOOT = "arch/boot/x86_64"
+MEDIA = "arch/x86_64"
+HOOK = "hooks/archiso_pxe_http"
+CMDLINE = (PROJECT / "recovery/cmdline").read_text().strip()
+
+
+def extract(iso, member, destination):
+    with destination.open("wb") as output:
+        subprocess.run(["bsdtar", "-xOf", iso, member], stdout=output, check=True)
+    if not destination.stat().st_size:
+        raise ValueError(f"empty installer file: {member}")
+
+
+def stage_bundle(iso, url, workspace, bundle):
+    members = subprocess.check_output(["bsdtar", "-tf", iso], text=True).splitlines()
+    paths = {p.removeprefix("./"): p for p in members}
+    if not all(f"{MEDIA}/{name}" in paths for name in ("omarchy-root.img.zst", "omarchy-root.img.zst.sha256")):
+        raise ValueError("expected x86 Omarchy install image and checksum are missing")
+    if not any(f"{MEDIA}/airootfs.{ext}" in paths for ext in ("sfs", "erofs")):
+        raise ValueError("expected live root is missing")
+
+    for kernel in ("linux-omarchy", "linux"):
+        vmlinuz = f"{BOOT}/vmlinuz-{kernel}"
+        initrd = f"{BOOT}/initramfs-{kernel}.img"
+        if vmlinuz in paths and initrd in paths:
+            break
+    else:
+        raise ValueError("no compatible live kernel and initramfs in this ISO")
+
+    extract(iso, paths[vmlinuz], bundle / "vmlinuz")
+    image = bundle / "initramfs.img"
+    extract(iso, paths[initrd], image)
+    files = subprocess.check_output(["lsinitcpio", "-n", "-l", image], text=True)
+    entries = {line.removeprefix("./") for line in files.splitlines()}
+    if not {"hooks/archiso", "hooks/archiso_pxe_common", HOOK} <= entries:
+        raise ValueError("the installer initramfs is missing required Archiso network hooks")
+
+    overlay = workspace / "overlay"
+    config = overlay / "etc/omarchy-cloud-reset/media"
+    config.parent.mkdir(parents=True)
+    (overlay / "hooks").mkdir()
+    with iso.open("rb") as stream:
+        checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+    config.write_text(f"{url}\n{checksum}\n{iso.stat().st_size}\n")
+    shutil.copy(PROJECT / "recovery/archiso_pxe_http", overlay / HOOK)
+    shutil.copy(PROJECT / "recovery/omarchy-probe.service", overlay / "omarchy-probe.service")
+    # Linux accepts a sequence of cpio archives. Each starts at a four-byte boundary.
+    with image.open("ab") as output:
+        output.write(bytes(-output.tell() % 4))
+        output.flush()
+        subprocess.run(
+            ["bsdtar", "--format=newc", "--uid", "0", "--gid", "0",
+             "-cf", "-", "etc", "hooks", "omarchy-probe.service"],
+            cwd=overlay, stdout=output, check=True,
+        )
+    (bundle / "cmdline").write_text(CMDLINE + "\n")
+
+
+def build(iso, url, output):
+    if not re.fullmatch(r"omarchy-[0-9]+\.[0-9]+\.[0-9]+-x86\.iso", iso.name):
+        raise ValueError("expected a stable Omarchy x86 release ISO filename")
+    official = f"https://iso.omarchy.org/{iso.name}"
+    if url is None:
+        url = official
+    elif url != official:
+        local = re.fullmatch(r"http://10\.0\.2\.2:([1-9][0-9]{0,4})/installer\.iso", url)
+        if not local or not 1 <= int(local[1]) <= 65535:
+            raise ValueError("expected an official ISO URL or the local QEMU test server")
+    if os.path.lexists(output):
+        raise ValueError(f"output already exists: {output}")
+    with tempfile.TemporaryDirectory(prefix=".omarchy-recovery-", dir=output.parent) as temporary:
+        work = Path(temporary)
+        private = work / iso.name
+        # A reflink (or an independent copy) keeps signature verification, hashing,
+        # and boot extraction on the same bytes even if another process edits the cache.
+        subprocess.run(["cp", "--reflink=auto", "--", iso, private], check=True)
+        shutil.copyfile(str(iso) + ".sig", str(private) + ".sig")
+        subprocess.run([PROJECT / "bin/prepare-installer", "--verify-file", private],
+                       stdout=subprocess.DEVNULL, check=True)
+        bundle = work / "boot"
+        bundle.mkdir()
+        stage_bundle(private, url, work, bundle)
+        bundle.rename(output)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--iso", type=Path, required=True, help="release ISO with adjacent .sig")
+    parser.add_argument("--output", type=Path, required=True, help="new directory for boot files")
+    parser.add_argument("--url", help="ISO URL in the recovery environment (default: official release)")
+    args = parser.parse_args()
+    try:
+        build(args.iso.absolute(), args.url, args.output.absolute())
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        parser.exit(1, f"build-recovery: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Check the cloud reset medium from the booted Omarchy live system
+After=local-fs.target
+
+[Service]
+Type=oneshot
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0
+ExecStart=/usr/bin/test -d /sys/firmware/efi
+ExecStart=:/bin/sh -ec 'medium=/run/archiso/bootmnt; dev=$(findmnt -nr -M "$medium" -o SOURCE); test -b "$dev"; test "$(cat "/sys/class/block/${dev##*/}/ro")" = 1; backing=$(cat "/sys/class/block/${dev##*/}/loop/backing_file"); test "$(findmnt -nr -T "$backing" -o FSTYPE)" = tmpfs'
+WorkingDirectory=/run/archiso/bootmnt/arch/x86_64
+ExecStart=/usr/bin/sha256sum --check --strict omarchy-root.img.zst.sha256
+ExecStart=/usr/bin/test -d /var/cache/omarchy/mirror/offline
+ExecStopPost=:/bin/sh -c 'if [ "$SERVICE_RESULT" = success ]; then echo OMARCHY_CLOUD_RESET_LIVE_OK; else echo OMARCHY_CLOUD_RESET_LIVE_FAILED; fi'

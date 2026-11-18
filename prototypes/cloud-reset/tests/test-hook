@@ -1,0 +1,124 @@
+#!/bin/sh
+# No privileges, block devices, or network used. Run with the initramfs ash
+# when available: /usr/lib/initcpio/busybox ash tests/test-hook
+set -eu
+base=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+. "$base/recovery/archiso_pxe_http"
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+release=https://iso.omarchy.org/omarchy-4.5.0-x86.iso
+local_url=http://10.0.2.2:49152/installer.iso
+
+getarg() {
+    case "$1" in
+        omarchy_cloud_reset) [ "$scenario" = missing-flag ] || printf 1;;
+        omarchy_cloud_probe) [ "$scenario" != probe ] || printf 1;;
+        ip) printf dhcp;;
+        copytoram) if [ "$scenario" = copy-live-only ]; then printf y; else printf n; fi;;
+        archiso_nfs_srv) [ "$scenario" != alternate-boot ] || printf server;;
+    esac
+    return 0
+}
+
+# The real handler sleeps forever after emitting its diagnostic.
+sleep() { exit 22; }
+mount() {
+    case "$*" in
+        "--mkdir -t tmpfs -o x-initrd.mount,size=$bytes,mode=0700,nosuid,nodev,noexec media-ram $dir/ram")
+            [ "$scenario" != mount-failure ] || return 1
+            mkdir "$dir/ram";;
+        "--mkdir -r -t iso9660 -o x-initrd.mount /dev/loop-test $dir/medium")
+            [ "$scenario" != iso-mount-failure ] || return 1
+            mkdir -p "$dir/medium/arch/x86_64"
+            for f in airootfs.sfs omarchy-root.img.zst omarchy-root.img.zst.sha256; do
+                printf x > "$dir/medium/arch/x86_64/$f"
+            done
+            if [ "$scenario" = bad-layout ]; then rm "$dir/medium/arch/x86_64/omarchy-root.img.zst.sha256"; fi;;
+        *) return 1;;
+    esac
+}
+curl() {
+    printf called > "$dir/requested"
+    while [ "$1" != --output ]; do shift; done
+    [ "$2" = "$dir/ram/installer.iso" ] && [ "$3" = "$url" ] || return 1
+    case "$scenario" in
+        download-failure) return 1;;
+        truncated) printf x > "$2";;
+        corrupt) printf X23456789 > "$2";;
+        *) cp "$dir/fixture" "$2";;
+    esac
+}
+losetup() {
+    [ "$*" = "--find --show --read-only $dir/ram/installer.iso" ] || return 1
+    [ "$scenario" != loop-failure ] || return 1
+    printf /dev/loop-test
+}
+
+check() (
+    scenario=$1
+    dir=$tmp/$scenario
+    mkdir "$dir"
+    url=$local_url
+    printf 123456789 > "$dir/fixture"
+    bytes=9
+    hash=$(sha256sum "$dir/fixture")
+    hash=${hash%% *}
+    case "$scenario" in
+        https) url=$release;;
+        http-remote) url=http://203.0.113.10:22/installer.iso;;
+        port) url=http://10.0.2.2:65536/installer.iso;;
+        path) url=http://10.0.2.2:10/path/installer.iso;;
+        bad-official) url=https://iso.omarchy.org/../strange.iso;;
+        bad-digest) hash=ABCDEF;;
+        bad-size) bytes=0009;;
+        size-overflow) bytes=9999999999999999999999999;;
+    esac
+    printf '%s\n%s\n%s\n' "$url" "$hash" "$bytes" > "$dir/metadata"
+    if [ "$scenario" = extra-record ]; then printf fourth >> "$dir/metadata"; fi
+    if [ "$scenario" = missing-media ]; then rm "$dir/metadata"; fi
+    if [ "$scenario" = insufficient-ram ]; then
+        printf 'MemAvailable: 2000000 kB\n' > "$dir/meminfo"
+    else
+        printf 'MemAvailable: 3000000 kB\n' > "$dir/meminfo"
+    fi
+    run_hook
+    [ "$mount_handler" = cloud_reset_mount_handler ] || exit 3
+    if [ "$scenario" = probe ] || [ "$scenario" = stock-failure ]; then
+        cloud_reset_mount_media() { :; }
+        archiso_mount_handler() {
+            [ "$scenario" != stock-failure ] || launch_interactive_shell
+            [ "$1" = "$dir/newroot" ]
+        }
+        cp() {
+            [ "$1" = /omarchy-probe.service ] || return 1
+            printf fixture > "$2"
+        }
+        cloud_reset_mount_handler "$dir/newroot"
+        [ -f "$dir/newroot/etc/systemd/system/multi-user.target.wants/omarchy-cloud-probe.service" ] || exit 4
+    else
+        archisosearchfilename=/boot/old.uuid
+        cloud_reset_mount_media "$dir/metadata" "$dir/meminfo" "$dir/ram" "$dir/medium"
+        [ "$archisodevice" = /dev/loop-test ] && [ "$copytoram" = n ] && [ -z "$archisosearchfilename" ] || exit 5
+    fi
+)
+
+for scenario in http https probe; do
+    check "$scenario" > "$tmp/log" 2>&1 || { cat "$tmp/log"; exit 1; }
+    if [ "$scenario" != probe ]; then grep -Fxq OMARCHY_CLOUD_RESET_MEDIA_VERIFIED "$tmp/log"; fi
+done
+for scenario in missing-flag copy-live-only alternate-boot http-remote port path bad-official bad-digest \
+        bad-size size-overflow extra-record missing-media insufficient-ram mount-failure download-failure \
+        truncated corrupt loop-failure iso-mount-failure bad-layout stock-failure; do
+    code=0
+    check "$scenario" > "$tmp/log" 2>&1 || code=$?
+    if [ "$code" != 22 ] || ! grep -q '^OMARCHY_CLOUD_RESET_FAILED:' "$tmp/log" || grep -q MEDIA_VERIFIED "$tmp/log"; then
+        cat "$tmp/log"
+        echo "Expected fail-closed recovery for $scenario, got $code" >&2
+        exit 1
+    fi
+    case "$scenario" in
+        download-failure|truncated|corrupt|loop-failure|iso-mount-failure|bad-layout) ;;
+        *) [ ! -e "$tmp/$scenario/requested" ] || { echo "Unexpected request for $scenario" >&2; exit 1; };;
+    esac
+done
+printf 'Recovery hook passed download, handoff, probe, and failure tests.\n'

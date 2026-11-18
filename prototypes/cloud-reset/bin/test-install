@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Compare an ISO install with a cloud reset of the same disposable x86 UEFI VM."""
+
+import argparse
+from contextlib import contextmanager, ExitStack
+import difflib
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+BIN = Path(__file__).resolve().parent
+loader = SourceFileLoader("omarchy_test_vm", str(BIN / "test-vm"))
+vm = module_from_spec(spec_from_loader(loader.name, loader))
+loader.exec_module(vm)
+
+USER = "resettester"
+MARKER = "/etc/omarchy-cloud-reset-test-marker"
+BINDINGS = ".config/hypr/bindings.lua"
+DEFAULT_FILES = (BINDINGS, ".config/foot/foot.ini", ".config/omarchy/shell.json")
+GIB = 1024 ** 3
+
+
+def make_cidata(scratch, password):
+    config = scratch / "config"
+    config.mkdir()
+    # Same two-partition 64 GiB layout and output format as the upstream ISO
+    # integration harness. Only disposable.raw is writable in these guests.
+    shutil.copyfile(BIN.parent / "tests/fixtures/cidata-layout.json", config / "user_configuration.json")
+    password_hash = subprocess.check_output(["openssl", "passwd", "-6", "-stdin"],
+                                             input=password + "\n", text=True).strip()
+    account = {"username": USER, "enc_password": password_hash, "groups": [], "sudo": True}
+    (config / "user_credentials.json").write_text(json.dumps({"root_enc_password": password_hash, "users": [account]}))
+    (config / "user_encrypt_installation.txt").write_text("false\n")
+    key = scratch / "guest-key"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-f", key, "-N", "", "-C", "disposable-test"], check=True)
+    shutil.copyfile(key.with_suffix(".pub"), config / "authorized_keys")
+    seed = scratch / "answers.iso"
+    subprocess.run(["bsdtar", "--format=iso9660", "--options", "iso9660:volume-id=CIDATA",
+                    "-cf", seed, "-C", config, "."], check=True)
+    return seed
+
+
+def free_port():
+    # QEMU fails to start if another process takes the port before it binds.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def qemu_args(qemu, code, scratch, ram, *, medium=None, seed=None, ssh_port=None):
+    net = "user,id=net"
+    if ssh_port:
+        net += f",hostfwd=tcp:127.0.0.1:{ssh_port}-:22"
+    command = [
+        qemu, "-no-user-config", "-nodefaults", "-machine", "q35,accel=kvm:tcg", "-uuid", vm.VM_UUID,
+        "-m", f"{ram}G", "-smp", "2", "-no-reboot",
+        "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={vm.blockfile(code)}",
+        "-drive", f"if=pflash,unit=1,format=raw,file={vm.blockfile(scratch / 'vars.fd')}",
+        "-drive", f"if=none,id=target,format=raw,file={vm.blockfile(scratch / 'disposable.raw')}",
+        "-device", f"virtio-blk-pci,drive=target,serial={vm.TARGET_SERIAL}",
+        "-netdev", net, "-device", "virtio-net-pci,netdev=net",
+        "-device", "VGA", "-display", "none", "-monitor", "none", "-serial", "stdio",
+    ]
+    if medium or seed:
+        command.extend(["-device", "virtio-scsi-pci,id=scsi"])
+    for drive, path in (("installer", medium), ("answers", seed)):
+        if path:
+            priority = ",bootindex=1" if drive == "installer" else ""
+            command.extend(["-drive", f"if=none,id={drive},media=cdrom,format=raw,readonly=on,file={vm.blockfile(path)}",
+                            "-device", f"scsi-cd,bus=scsi.0,drive={drive}{priority}"])
+    return command
+
+
+@contextmanager
+def guest(command, scratch, phase):
+    print(phase, flush=True)
+    log_path = scratch / (phase.replace(" ", "-") + ".log")
+    with log_path.open("wb") as log, subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                                       stdout=log, stderr=subprocess.STDOUT) as process:
+        try:
+            yield process
+        except Exception:
+            with log_path.open("rb") as recent:
+                recent.seek(max(0, log_path.stat().st_size - 4096))
+                print(recent.read().decode(errors="replace"), file=sys.stderr)
+            raise
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def wait_reboot(process, timeout):
+    # -no-reboot exits on the guest's reboot. A disk-only boot below
+    # independently verifies the installation; exit zero alone is insufficient.
+    if process.wait(timeout=timeout) != 0:
+        raise ValueError("QEMU exited unsuccessfully")
+
+
+def ssh_args(scratch, port, phase):
+    return ["ssh", "-F", "/dev/null", "-i", str(scratch / "guest-key"), "-p", str(port),
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR",
+            "-o", "GlobalKnownHostsFile=/dev/null", "-o", f"UserKnownHostsFile={scratch / (phase + '.known-hosts')}",
+            f"{USER}@127.0.0.1"]
+
+
+def wait_login(ssh, process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise ValueError("installed guest exited before login")
+        try:
+            result = subprocess.run([*ssh, "omarchy-done check finalize-user"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=12)
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode == 0:
+            return
+        time.sleep(2)
+    raise ValueError("installed guest did not accept its test SSH key before the timeout")
+
+
+def installed_manifest(ssh, version):
+    command = f"""set -eu
+test "$(id -un)" = {USER}
+test -d /sys/firmware/efi
+test "$(findmnt -n -o FSTYPE /)" = btrfs
+test "$(findmnt -n -o FSROOT /)" = /@
+test "$(cat /sys/block/vda/serial)" = {vm.TARGET_SERIAL}
+test ! -e /run/archiso/bootmnt
+test ! -e {MARKER}
+case "$(omarchy-version)" in {shlex.quote(version)}|{shlex.quote(version)}-*) ;; *) exit 1;; esac
+cd "$HOME"
+export LC_ALL=C
+sha256sum {' '.join(map(shlex.quote, DEFAULT_FILES))}
+pacman -Q | sort
+"""
+    return subprocess.check_output([*ssh, command], text=True, timeout=45).splitlines()
+
+
+def arm_reset(ssh, scratch, password):
+    # Mark both system and user state; compare the restored bindings on the next boot.
+    subprocess.run([*ssh, f"set -e; printf '\\n-- disposable reset test\\n' >> {BINDINGS}; sync"],
+                   stdin=subprocess.DEVNULL, check=True, timeout=30)
+    for local, destination in ((scratch / "esp/EFI/BOOT/BOOTX64.EFI", "recovery.efi"),
+                               (BIN / "schedule-recovery", "schedule-recovery")):
+        with local.open("rb") as data:
+            subprocess.run([*ssh, f"umask 077; cat > {destination}"], stdin=data, check=True, timeout=180)
+    subprocess.run([*ssh, "chmod 700 ./schedule-recovery"], check=True, timeout=20)
+    elevated = f"touch {MARKER} && test -f {MARKER} && sync && ./schedule-recovery --uki ./recovery.efi"
+    subprocess.run([*ssh, "sudo -S -p '' sh -ec " + shlex.quote(elevated)],
+                   input=password + "\n", text=True, check=True, timeout=180)
+    # Queue the reboot first so the SSH process can finish returning its status.
+    subprocess.run([*ssh, "sudo -S -p '' systemctl --no-block reboot"],
+                   input=password + "\n", text=True, check=True, timeout=20)
+
+
+def compare(before, after):
+    if before != after:
+        changes = list(difflib.unified_diff(before, after, "iso-install", "cloud-reset", lineterm=""))
+        raise ValueError("installed manifests differ:\n" + "\n".join(changes[:50]))
+
+
+def run(args):
+    qemu, code, template = vm.dependencies()
+    for tool in ("ssh", "ssh-keygen", "bsdtar", "openssl"):
+        if not shutil.which(tool):
+            raise ValueError(f"{tool} is required")
+    if args.iso:
+        iso = args.iso.expanduser().absolute()
+    else:
+        prepare = [BIN / "prepare-installer"]
+        if args.version:
+            prepare += ["--version", args.version]
+        iso = Path(subprocess.check_output(prepare, text=True).strip())
+    release = re.fullmatch(r"omarchy-(\d+\.\d+\.\d+)-x86\.iso", iso.name)
+    if not release:
+        raise ValueError("unable to identify x86 release ISO")
+    parent = args.work_dir or Path.home() / ".cache" / "omarchy-cloud-reset"
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="install-test-", dir=parent) as temp, ExitStack() as stack:
+        scratch = Path(temp)
+        # Pin the bytes for the complete run. Independent opens by the control
+        # guest, HTTP server, and boot builder must all see the same ISO.
+        subprocess.run(["cp", "--reflink=auto", "--", iso, str(iso) + ".sig", scratch], check=True)
+        iso = scratch / iso.name
+        subprocess.run([BIN / "prepare-installer", "--verify-file", iso], stdout=subprocess.DEVNULL, check=True)
+        server = stack.enter_context(vm.image_server(iso))
+        ram = (server.image_size + GIB - 1) // GIB + 4
+        shutil.copyfile(template, scratch / "vars.fd")
+        with (scratch / "disposable.raw").open("xb") as disk:
+            disk.truncate(64 * GIB)
+        password = secrets.token_urlsafe(24)
+        seed = make_cidata(scratch, password)
+        bundle = scratch / "bundle"
+        subprocess.run([BIN / "build-recovery", "--iso", iso, "--output", bundle, "--url",
+                        f"http://10.0.2.2:{server.server_port}/installer.iso"], check=True)
+        vm.make_recovery_esp(bundle, scratch / "esp", probe=False)
+
+        common = (qemu, code, scratch, ram)
+        with guest(qemu_args(*common, medium=iso, seed=seed), scratch, "Installing USB-equivalent control") as q:
+            wait_reboot(q, args.timeout)
+        port = free_port()
+        ssh = ssh_args(scratch, port, "first")
+        with guest(qemu_args(*common, ssh_port=port), scratch, "Arming recovery in installed guest") as q:
+            wait_login(ssh, q, args.timeout)
+            baseline = installed_manifest(ssh, release[1])
+            arm_reset(ssh, scratch, password)
+            wait_reboot(q, 120)
+        if server.transferred.is_set():
+            raise ValueError("unexpected installer download before the recovery boot")
+        # Only the answer CD is attached here. Firmware must consume BootNext
+        # and the guest must fetch its installation medium over the network.
+        with guest(qemu_args(*common, seed=seed), scratch, "Installing via one-time cloud reset") as q:
+            wait_reboot(q, args.timeout)
+        if not server.transferred.is_set():
+            raise ValueError("cloud reset boot did not fetch the complete installer")
+        port = free_port()
+        ssh = ssh_args(scratch, port, "after")
+        with guest(qemu_args(*common, ssh_port=port), scratch, "Checking installed reset system") as q:
+            wait_login(ssh, q, args.timeout)
+            compare(baseline, installed_manifest(ssh, release[1]))
+    print("Passed: reset removed old state, booted the installed disk, and matched the control's package versions and sampled defaults.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    release = parser.add_mutually_exclusive_group()
+    release.add_argument("--version", help="stable release (default: latest)")
+    release.add_argument("--iso", type=Path, help="cached signed ISO with adjacent .sig")
+    parser.add_argument("--work-dir", type=Path, help="parent directory for temporary VM files")
+    parser.add_argument("--timeout", type=int, default=2400, help="seconds allowed per install or login")
+    args = parser.parse_args()
+    if os.geteuid() == 0 or args.timeout <= 0:
+        parser.error("use a regular user and a positive timeout")
+    try:
+        run(args)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        parser.exit(1, f"test-install: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

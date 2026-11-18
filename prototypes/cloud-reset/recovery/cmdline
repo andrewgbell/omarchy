@@ -1,0 +1,1 @@
+ip=dhcp omarchy_cloud_reset=1 copytoram=n archisobasedir=arch cow_spacesize=2G

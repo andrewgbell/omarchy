@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Package a prepared Omarchy recovery bundle as an x86-64 UEFI executable."""
+
+import argparse
+import os
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+
+
+PROJECT = Path(__file__).resolve().parents[1]
+STUB = Path("/usr/lib/systemd/boot/efi/linuxx64.efi.stub")
+PROBE_ARGS = b" omarchy_cloud_probe=1 console=tty0 console=ttyS0,115200"
+OS_RELEASE = b'ID=omarchy\nNAME=Omarchy\nPRETTY_NAME="Omarchy cloud reset installer"\n'
+
+
+def efi_header(image):
+    """Read the PE32+ image layout needed by objcopy's section VMAs."""
+    with image.open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) < 64 or dos[:2] != b"MZ":
+            raise ValueError(f"{image.name} lacks an EFI executable header")
+        stream.seek(struct.unpack_from("<I", dos, 60)[0])
+        coff = stream.read(24)
+        if len(coff) != 24 or coff[:6] != b"PE\0\0\x64\x86":
+            raise ValueError(f"{image.name} is not an x86-64 PE image")
+        count = struct.unpack_from("<H", coff, 6)[0]
+        optional = stream.read(struct.unpack_from("<H", coff, 20)[0])
+        if len(optional) < 112 or optional[:2] != b"\x0b\x02" or optional[68:70] != b"\x0a\x00":
+            raise ValueError(f"{image.name} is not a PE32+ EFI application")
+        base, alignment = struct.unpack_from("<QI", optional, 24)
+        image_size = struct.unpack_from("<I", optional, 56)[0]
+        if not alignment or alignment & (alignment - 1) or not image_size:
+            raise ValueError(f"invalid PE alignment or image size in {image.name}")
+        sections = {}
+        for _ in range(count):
+            header = stream.read(40)
+            if len(header) != 40:
+                raise ValueError(f"truncated PE section headers in {image.name}")
+            name = header[:8].rstrip(b"\0")
+            # VirtualSize, VirtualAddress, SizeOfRawData and PointerToRawData.
+            sections[name] = struct.unpack_from("<IIII", header, 8)
+    return base, alignment, image_size, sections
+
+
+def verify_sections(image, payloads, expected_rvas):
+    sections = efi_header(image)[3]
+    with image.open("rb") as output:
+        for name, path in payloads.items():
+            entry = sections.get(name.encode())
+            if entry is None:
+                raise ValueError(f"missing {name} section in assembled EFI image")
+            size, rva, raw_size, offset = entry
+            if size != path.stat().st_size or raw_size < size or rva != expected_rvas[name]:
+                raise ValueError(f"incorrect {name} section layout")
+            output.seek(offset)
+            with path.open("rb") as source:
+                while block := source.read(1024 * 1024):
+                    if output.read(len(block)) != block:
+                        raise ValueError(f"incorrect {name} contents")
+
+
+def build(bundle, output, probe=False):
+    if os.path.lexists(output):
+        raise ValueError(f"output already exists: {output}")
+    kernel = bundle / "vmlinuz"
+    efi_header(kernel)
+    with kernel.open("rb") as stream:
+        stream.seek(0x202)
+        if stream.read(4) != b"HdrS":
+            raise ValueError("expected the x86 Linux boot protocol header in vmlinuz")
+
+    cmdline = (PROJECT / "recovery/cmdline").read_bytes().strip()
+    if (bundle / "cmdline").read_bytes() != cmdline + b"\n":
+        raise ValueError("bundle does not contain the expected recovery kernel options")
+    base, alignment, offset, _ = efi_header(STUB)
+    with tempfile.TemporaryDirectory(prefix=".omarchy-uki-", dir=output.parent) as tmp:
+        work = Path(tmp)
+        (work / "os-release").write_bytes(OS_RELEASE)
+        (work / "cmdline").write_bytes(cmdline + (PROBE_ARGS if probe else b"") + b"\0")
+        payloads = {".osrel": work / "os-release", ".cmdline": work / "cmdline",
+                    ".initrd": bundle / "initramfs.img", ".linux": kernel}
+        command = ["objcopy"]
+        rvas = {}
+        for name, path in payloads.items():
+            size = path.stat().st_size
+            offset = (offset + alignment - 1) & -alignment
+            if size == 0 or offset + size + alignment >= 2**32:
+                raise ValueError(f"unsupported {name} size for a unified EFI image")
+            flags = "code" if name == ".linux" else "data"
+            command.extend(["--add-section", f"{name}={path}",
+                            "--change-section-vma", f"{name}={base + offset:#x}",
+                            "--set-section-flags", f"{name}=alloc,load,readonly,contents,{flags}"])
+            rvas[name] = offset
+            offset += size
+
+        image = work / "recovery.efi"
+        subprocess.run([*command, STUB, image], check=True)
+        verify_sections(image, payloads, rvas)
+        # Stage on the destination filesystem and publish with a no-replace
+        # rename. This also works on FAT filesystems, which lack hard links.
+        subprocess.run(["mv", "--no-copy", "--update=none-fail", "-T", "--", image, output],
+                       check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle", type=Path, required=True, help="directory from build-recovery")
+    parser.add_argument("--output", type=Path, required=True, help="new EFI file in the workspace")
+    parser.add_argument("--probe", action="store_true", help="enable the VM boot probe and serial console")
+    args = parser.parse_args()
+    try:
+        build(args.bundle, args.output, args.probe)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"build-uki: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

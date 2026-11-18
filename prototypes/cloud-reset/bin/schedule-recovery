@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Schedule a recovery UKI once on the dedicated disposable x86 UEFI VM."""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+
+
+VM_ID = "04087d63-1df8-4018-bd1a-bd4ef98a66dd"
+DISK_SERIAL = "omarchy-reset-test"
+ESP_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+ESP = Path("/boot")
+STATE = Path("/var/lib/omarchy-cloud-reset-prototype")
+
+
+def output(*args):
+    return subprocess.check_output(args, text=True, env=dict(os.environ, LC_ALL="C")).strip()
+
+
+def target(devices, mounts):
+    # Omarchy can expose swap as a zram disk. It has no persistent storage.
+    disks = [d for d in devices if d["type"] == "disk" and not re.fullmatch(r"/dev/zram\d+", d["path"])]
+    if len(disks) != 1 or disks[0]["serial"] != DISK_SERIAL or disks[0]["ro"]:
+        raise ValueError("expected the single writable disposable VM disk")
+    if any(str(d["label"]).lower() == "cidata" for d in devices):
+        raise ValueError("disconnect unattended installer media first")
+    if len(mounts) != 1 or mounts[0]["target"] != str(ESP) or mounts[0]["fstype"] != "vfat":
+        raise ValueError("expected a FAT ESP mounted at /boot")
+    if "rw" not in mounts[0]["vfs-options"].split(","):
+        raise ValueError("the guest's ESP is read-only")
+    for p in devices:
+        if (p["path"] == mounts[0]["source"] and p["type"] == "part" and p["pkname"] == disks[0]["path"]
+                and p["parttype"] == ESP_TYPE and not p["ro"] and isinstance(p["partn"], int)):
+            return disks[0]["path"], str(p["partn"]), str(uuid.UUID(p["partuuid"]))
+    raise ValueError("/boot must be a GPT EFI System Partition on the disposable VM disk")
+
+
+def guest_target():
+    if os.geteuid() != 0:
+        raise ValueError("run as root inside the disposable guest")
+    if (os.uname().machine != "x86_64" or output("systemd-detect-virt", "--vm") not in ("qemu", "kvm")
+            or Path("/sys/class/dmi/id/product_uuid").read_text().strip().lower() != VM_ID):
+        raise ValueError("this command only runs inside the marked x86 prototype VM")
+    if Path("/sys/firmware/efi/fw_platform_size").read_text().strip() != "64":
+        raise ValueError("expected 64-bit UEFI")
+    sb = Path("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c")
+    if sb.exists() and sb.read_bytes()[4:] != b"\0":
+        raise ValueError("the disposable guest must have Secure Boot disabled")
+    devices = json.loads(output("lsblk", "--list", "--json", "--paths", "-o",
+                                "PATH,TYPE,RO,PKNAME,PARTN,PARTTYPE,PARTUUID,SERIAL,LABEL"))["blockdevices"]
+    mounts = json.loads(output("findmnt", "--json", "-M", ESP, "-o", "TARGET,SOURCE,FSTYPE,VFS-OPTIONS"))["filesystems"]
+    return target(devices, mounts)
+
+
+def firmware():
+    text = output("efibootmgr", "--verbose")
+    order = re.search(r"^BootOrder:\s*([0-9A-Fa-f,]*)$", text, re.M)
+    if not order:
+        raise ValueError("cannot establish the existing UEFI BootOrder")
+    next_boot = re.search(r"^BootNext:[ \t]*([0-9A-Fa-f]{4})$", text, re.M)
+    if "BootNext:" in text and not next_boot:
+        raise ValueError("could not read BootNext")
+    return text, order[1].upper().split(","), next_boot[1].upper() if next_boot else None
+
+
+def owned_entry(text, token, part, guid):
+    label = "OmarchyCloudReset-" + token
+    entries = re.findall(r"^Boot([0-9A-Fa-f]{4})\*?[ \t]+" + label + r"\t([^\n]+)$", text, re.M)
+    if not entries:
+        if label in text:
+            raise ValueError("found an unexpected firmware entry for the staged recovery image")
+        return None
+    path = rf"\EFI\{label}\recovery.efi"
+    device = rf"HD\({part},GPT,{guid},0x[0-9a-f]+,0x[0-9a-f]+\)/"
+    if len(entries) != 1 or not re.fullmatch(device + "(?:" + re.escape(path)
+                                               + "|File\\(" + re.escape(path) + "\\))", entries[0][1], re.I):
+        raise ValueError("recovery entry identity is ambiguous; inspect guest EFI entries")
+    return entries[0][0].upper()
+
+
+def verify_uki(path):
+    if output("bootctl", "kernel-identify", path) != "uki":
+        raise ValueError("expected a unified kernel image")
+    headers = output("objdump", "-w", "-h", path)
+    if "file format pei-x86-64" not in headers:
+        raise ValueError("expected an x86-64 EFI image")
+    sections = {name: (int(size, 16), int(offset, 16)) for name, size, offset in re.findall(
+        r"^\s*\d+\s+(\.\w+)\s+([\da-fA-F]+)\s+\S+\s+\S+\s+([\da-fA-F]+)\s+", headers, re.M)}
+    if not all(sections.get(name, (0,))[0] for name in (".linux", ".initrd", ".cmdline")):
+        raise ValueError("the UKI lacks its kernel, initramfs, or command line")
+    size, offset = sections[".cmdline"]
+    if size > 4096:
+        raise ValueError("invalid recovery command line")
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        args = stream.read(size).rstrip(b"\0").split()
+    if not {b"ip=dhcp", b"omarchy_cloud_reset=1", b"copytoram=n"}.issubset(args):
+        raise ValueError("UKI is missing the cloud recovery command line")
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def cancel(esp, receipt, part, guid):
+    fields = receipt.read_text().splitlines()
+    if len(fields) != 2 or fields[0] != guid or not re.fullmatch(r"[a-f0-9]{32}", fields[1]):
+        raise ValueError("the recovery receipt does not match this ESP")
+    token = fields[1]
+    text, order, next_boot = firmware()
+    number = owned_entry(text, token, part, guid)
+    if number:
+        if number in order:
+            raise ValueError("recovery was added to persistent BootOrder; refusing to alter it")
+        if next_boot == number:
+            output("efibootmgr", "--delete-bootnext")
+        output("efibootmgr", "--bootnum", number, "--delete-bootnum")
+    directory = esp / "EFI" / ("OmarchyCloudReset-" + token)
+    if directory.exists():
+        (directory / "recovery.efi").unlink(missing_ok=True)
+        directory.rmdir()
+        sync_dir(directory.parent)
+    receipt.unlink()
+    sync_dir(receipt.parent)
+
+
+def schedule(esp, receipt, disk, part, guid, uki):
+    if receipt.exists():
+        raise ValueError("an earlier recovery transaction exists; use --cancel first")
+    _, order, next_boot = firmware()
+    if next_boot:
+        raise ValueError("another one-time boot is already scheduled")
+    token = uuid.uuid4().hex
+    label = "OmarchyCloudReset-" + token
+    directory = esp / "EFI" / label
+    if directory.exists():
+        raise ValueError("recovery directory already exists")
+    # Persist the unique owner token before either ESP or firmware is changed.
+    pending = receipt.with_suffix(".tmp")
+    with pending.open("w") as record:
+        record.write(f"{guid}\n{token}\n")
+        record.flush()
+        os.fsync(record.fileno())
+    pending.replace(receipt)
+    sync_dir(receipt.parent)
+    try:
+        directory.mkdir()
+        destination = directory / "recovery.efi"
+        with os.fdopen(os.open(uki, os.O_RDONLY | os.O_NONBLOCK), "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("the UKI must be a regular file")
+            with destination.open("xb") as copy:
+                shutil.copyfileobj(source, copy)
+                copy.flush()
+                os.fsync(copy.fileno())
+        verify_uki(destination)
+        sync_dir(directory)
+        sync_dir(directory.parent)
+        output("efibootmgr", "--create-only", "--disk", disk, "--part", part, "--label", label,
+               "--loader", rf"\EFI\{label}\recovery.efi")
+        text, new_order, next_boot = firmware()
+        number = owned_entry(text, token, part, guid)
+        if not number or new_order != order or next_boot:
+            raise ValueError("could not reserve an isolated one-time boot entry")
+        output("efibootmgr", "--bootnext", number)
+        text, new_order, next_boot = firmware()
+        if next_boot != number or order != new_order or owned_entry(text, token, part, guid) != number:
+            raise ValueError("firmware did not retain the requested one-time boot")
+        return number
+    except (OSError, ValueError, subprocess.CalledProcessError, KeyboardInterrupt):
+        cancel(esp, receipt, part, guid)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_mutually_exclusive_group(required=True)
+    actions.add_argument("--uki", type=Path, help="arm an x86 cloud recovery UKI for the next boot")
+    actions.add_argument("--cancel", action="store_true", help="remove this prototype's scheduled boot and files")
+    actions.add_argument("--check", action="store_true", help="check whether this guest can schedule recovery")
+    args = parser.parse_args()
+    os.environ["PATH"] = "/usr/bin:/bin"
+    try:
+        disk, part, guid = guest_target()
+        if args.check:
+            if firmware()[2] or (STATE / "transaction").exists():
+                raise ValueError("a one-time boot or recovery transaction is already pending")
+            return
+        STATE.mkdir(mode=0o700, exist_ok=True)
+        sync_dir(STATE.parent)
+        with (STATE / "lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            receipt = STATE / "transaction"
+            if args.cancel:
+                if receipt.exists():
+                    cancel(ESP, receipt, part, guid)
+                print("No recovery boot is scheduled by this prototype.")
+            else:
+                number = schedule(ESP, receipt, disk, part, guid, args.uki)
+                print(f"Recovery scheduled in the VM as BootNext {number}. Reboot the guest to start.")
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"schedule-recovery: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Cache a verified, stable x86 Omarchy installer in the current user's files."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+RELEASES = "https://api.github.com/repos/omacom/omarchy/releases"
+IMAGES = "https://iso.omarchy.org"
+PRIMARY_KEY = "40DFB630FF42BCFFB047046CF0134EE680CAC571"
+PACKAGED_KEY = Path("/usr/share/pacman/keyrings/omarchy.gpg")
+VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+
+
+def fetch(url, destination=None, limit=None):
+    command = [
+        "curl", "--disable", "--proto", "=https", "--proto-redir", "=https",
+        "--location", "--fail", "--silent", "--show-error", "--retry", "2",
+        "--connect-timeout", "15", "--speed-time", "60", "--speed-limit", "1024",
+    ]
+    if limit:
+        command.extend(["--max-filesize", str(limit)])
+    if destination:
+        command.extend(["--output", str(destination)])
+    return subprocess.run([*command, url], check=True, stdout=subprocess.PIPE).stdout
+
+
+def stable_version(requested):
+    if requested and not VERSION.fullmatch(requested):
+        raise ValueError("expected a stable version number, e.g. 4.5.0")
+    selector = f"tags/v{requested}" if requested else "latest"
+    release = json.loads(fetch(f"{RELEASES}/{selector}", limit=2**20))
+    if not isinstance(release, dict) or release.get("draft") is not False or release.get("prerelease") is not False:
+        raise ValueError("GitHub did not return a published stable release")
+    tag = release.get("tag_name")
+    if not isinstance(tag, str) or not tag.startswith("v") or not VERSION.fullmatch(tag[1:]):
+        raise ValueError("invalid release tag in GitHub response")
+    version = tag[1:]
+    if requested and requested != version:
+        raise ValueError("GitHub returned a different release than requested")
+    if tuple(map(int, version.split("."))) < (4, 5, 0):
+        raise ValueError("the x86 installer naming scheme requires Omarchy 4.5.0 or later")
+    return version
+
+
+def expected_checksum(sidecar, filename):
+    fields = sidecar.decode("ascii").split()
+    if len(fields) not in (1, 2) or not re.fullmatch("[a-fA-F0-9]{64}", fields[0]):
+        raise ValueError("invalid release SHA-256 file")
+    if len(fields) == 2 and fields[1].removeprefix("*") != filename:
+        raise ValueError("release SHA-256 file names a different image")
+    return fields[0].lower()
+
+
+def load_keyring(key_file, scratch):
+    # gpgv needs a binary keyring. Dearmor accepts both binary and armored input.
+    keyring = scratch / "release.gpg"
+    subprocess.run(
+        ["gpg", "--no-options", "--homedir", scratch, "--batch", "--dearmor",
+         "--output", keyring, key_file.expanduser().resolve()], check=True,
+    )
+    return keyring
+
+
+def verify(image, signature, keyring, scratch, digest=None):
+    if digest:
+        with image.open("rb") as source:
+            if hashlib.file_digest(source, "sha256").hexdigest() != digest:
+                raise ValueError("installer SHA-256 differs from the official release")
+    result = subprocess.run(
+        ["gpgv", "--homedir", scratch, "--keyring", keyring, "--status-fd", "1", signature, image],
+        capture_output=True, text=True,
+    )
+    claims = [line.split() for line in result.stdout.splitlines() if line.startswith("[GNUPG:] ")]
+    signatures = [claim for claim in claims if claim[1] == "VALIDSIG"]
+    rejected = {"BADSIG", "ERRSIG", "REVKEYSIG", "EXPSIG", "EXPKEYSIG"}
+    if (result.returncode or any(claim[1] in rejected for claim in claims)
+            or len(signatures) != 1 or signatures[0][-1] != PRIMARY_KEY):
+        raise ValueError("installer does not have a valid signature from the Omarchy release key")
+
+
+def verify_file(image, key_file):
+    image = image.expanduser().absolute()
+    if not re.fullmatch(rf"omarchy-({VERSION.pattern})-x86\.iso", image.name):
+        raise ValueError("expected an omarchy-X.Y.Z-x86.iso filename with its adjacent .sig")
+    with tempfile.TemporaryDirectory() as temporary:
+        scratch = Path(temporary)
+        verify(image, image.with_suffix(".iso.sig"), load_keyring(key_file, scratch), scratch)
+    return image
+
+
+def prepare(cache, key_file, requested=None):
+    version = stable_version(requested)
+    filename = f"omarchy-{version}-x86.iso"
+    url = f"{IMAGES}/{filename}"
+    digest = expected_checksum(fetch(url + ".sha256", limit=4096), filename)
+    cache = cache.expanduser().resolve()
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    final = cache / version / filename
+    with (cache / ".prepare.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with tempfile.TemporaryDirectory(prefix=".prepare-", dir=cache) as temporary:
+            scratch = Path(temporary)
+            keyring = load_keyring(key_file, scratch)
+            signature = scratch / (filename + ".sig")
+            fetch(url + ".sig", destination=signature, limit=2**20)
+            reuse = False
+            if final.is_file():
+                try:
+                    verify(final, signature, keyring, scratch, digest)
+                    reuse = True
+                except ValueError:
+                    print("Cached ISO failed verification. Fetching a replacement.", file=sys.stderr)
+            if not reuse:
+                candidate = scratch / filename
+                print(f"Downloading Omarchy {version} x86 installer...", file=sys.stderr)
+                fetch(url, destination=candidate)
+                verify(candidate, signature, keyring, scratch, digest)
+                final.parent.mkdir(mode=0o700, exist_ok=True)
+                os.replace(candidate, final)
+            os.replace(signature, final.with_suffix(".iso.sig"))
+    return final
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--version", help="use a specific stable release (default: latest)")
+    modes.add_argument("--verify-file", type=Path, help="verify an ISO and adjacent .sig offline")
+    default_cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy-cloud-reset"
+    parser.add_argument("--cache-dir", type=Path, default=default_cache)
+    parser.add_argument("--key-file", type=Path, default=PACKAGED_KEY,
+                        help="Omarchy public key, binary or armored (default: installed Omarchy keyring)")
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        parser.exit(1, "Run prepare-installer as an ordinary user.\n")
+    try:
+        if args.verify_file:
+            print(verify_file(args.verify_file, args.key_file))
+        else:
+            print(prepare(args.cache_dir, args.key_file, args.version))
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"prepare-installer: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
