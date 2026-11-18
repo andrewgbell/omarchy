@@ -1,0 +1,91 @@
+#!/usr/bin/ash
+
+# This replaces the archiso HTTP hook only in the prototype's VM initramfs.
+# Its three-line media record is generated after verifying the ISO signature.
+cloud_reset_failed() {
+    printf 'OMARCHY_CLOUD_RESET_FAILED: %s\n' "$*" >&2
+    while :; do sleep 3600; done
+}
+
+run_hook() {
+    [ "$(getarg omarchy_cloud_reset)" = 1 ] || cloud_reset_failed "Recovery boot flag missing"
+    [ "$(getarg ip)" = dhcp ] || cloud_reset_failed "Recovery requires DHCP"
+    [ "$(getarg copytoram)" = n ] || cloud_reset_failed "Recovery requires copytoram=n"
+
+    # Only the ISO fetched below may supply this guest's live OS and overlay.
+    # In particular the archiso NFS hook runs after this one.
+    local option
+    for option in archiso_nfs_srv archiso_nbd_srv archiso_http_srv img_dev img_label img_loop cow_device cow_label; do
+        [ -z "$(getarg "$option")" ] || cloud_reset_failed "Unexpected recovery boot option: $option"
+    done
+    export mount_handler=cloud_reset_mount_handler
+}
+
+cloud_reset_mount_handler() {
+    local units="$1/etc/systemd/system"
+    # Stock archiso otherwise opens a shell on failure and resumes when it exits.
+    launch_interactive_shell() { cloud_reset_failed "Archiso could not start the installer"; }
+    cloud_reset_mount_media /etc/omarchy-cloud-reset/media /proc/meminfo /run/archiso/media-ram /run/archiso/bootmnt
+    archiso_mount_handler "$1" || cloud_reset_failed "Could not mount the live system"
+    if [ "$(getarg omarchy_cloud_probe)" = 1 ]; then
+        mkdir -p "$units/multi-user.target.wants" &&
+            cp /omarchy-probe.service "$units/omarchy-cloud-probe.service" &&
+            ln -s ../omarchy-cloud-probe.service "$units/multi-user.target.wants/omarchy-cloud-probe.service" ||
+            cloud_reset_failed "Could not install guest probe"
+    fi
+}
+
+cloud_reset_mount_media() {
+    local record="$1" meminfo="$2" stage="$3" medium="$4"
+    local url expected bytes extra port available required_kib actual digest loop image
+    {
+        IFS= read -r url && IFS= read -r expected && IFS= read -r bytes || cloud_reset_failed "Incomplete media record"
+        if IFS= read -r extra || [ -n "$extra" ]; then cloud_reset_failed "Unexpected media record data"; fi
+    } < "$record" || cloud_reset_failed "Cannot read media record"
+
+    case "$url" in
+        http://10.0.2.2:*/installer.iso)
+            port=${url#http://10.0.2.2:}
+            port=${port%/installer.iso}
+            case "$port" in ''|0*|*[!0-9]*) cloud_reset_failed "Invalid QEMU HTTP endpoint";; esac
+            [ "${#port}" -le 5 ] && [ "$port" -le 65535 ] || cloud_reset_failed "Invalid QEMU HTTP port"
+            ;;
+        https://iso.omarchy.org/*)
+            printf '%s\n' "$url" | grep -Eq '^https://iso\.omarchy\.org/omarchy-[0-9]+\.[0-9]+\.[0-9]+-x86\.iso$' ||
+                cloud_reset_failed "Invalid official release URL"
+            ;;
+        *) cloud_reset_failed "Unrecognised recovery image URL";;
+    esac
+    case "$expected" in ''|*[!0123456789abcdef]*) cloud_reset_failed "Invalid SHA-256 digest";; esac
+    [ "${#expected}" -eq 64 ] || cloud_reset_failed "Invalid SHA-256 digest length"
+    case "$bytes" in ''|0*|*[!0-9]*) cloud_reset_failed "Invalid ISO size";; esac
+    [ "${#bytes}" -le 11 ] || cloud_reset_failed "Unreasonable ISO size"
+
+    available=$(awk '$1 == "MemAvailable:" && $3 == "kB" {print $2; exit}' "$meminfo")
+    case "$available" in ''|*[!0-9]*) cloud_reset_failed "Cannot determine available RAM";; esac
+    # Leave at least 2 GiB for the installer after the whole medium is in RAM.
+    required_kib=$(( (bytes + 1023) / 1024 + 2097152 ))
+    [ "$available" -ge "$required_kib" ] || cloud_reset_failed "Insufficient RAM for the ISO and installer"
+
+    mount --mkdir -t tmpfs -o "x-initrd.mount,size=$bytes,mode=0700,nosuid,nodev,noexec" media-ram "$stage" ||
+        cloud_reset_failed "Could not allocate ISO staging area"
+    image="$stage/installer.iso"
+    curl --disable --fail --silent --show-error --noproxy '*' --proto '=http,https' \
+        --connect-timeout 20 --speed-time 90 --speed-limit 1024 --max-filesize "$bytes" \
+        --output "$image" "$url" || cloud_reset_failed "ISO download failed"
+    actual=$(stat -c %s "$image") || cloud_reset_failed "Cannot check downloaded file size"
+    [ "$actual" = "$bytes" ] || cloud_reset_failed "ISO length mismatch"
+    digest=$(sha256sum "$image") || cloud_reset_failed "Cannot hash downloaded ISO"
+    [ "${digest%% *}" = "$expected" ] || cloud_reset_failed "ISO digest mismatch"
+
+    loop=$(losetup --find --show --read-only "$image") || cloud_reset_failed "Could not attach ISO read-only"
+    mount --mkdir -r -t iso9660 -o x-initrd.mount "$loop" "$medium" || cloud_reset_failed "Could not mount verified ISO"
+    [ -s "$medium/arch/x86_64/airootfs.sfs" ] || [ -s "$medium/arch/x86_64/airootfs.erofs" ] ||
+        cloud_reset_failed "ISO lacks the x86 live filesystem"
+    [ -s "$medium/arch/x86_64/omarchy-root.img.zst" ] && [ -s "$medium/arch/x86_64/omarchy-root.img.zst.sha256" ] ||
+        cloud_reset_failed "ISO lacks the Omarchy installer image or checksum"
+
+    # archiso searches local block devices if its boot-media search is set.
+    export archisodevice="$loop" archisosearchfilename="" archisosearchuuid="" copytoram=n
+    printf 'OMARCHY_CLOUD_RESET_MEDIA_VERIFIED\n'
+}

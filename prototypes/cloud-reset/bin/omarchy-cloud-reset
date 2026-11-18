@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Prepare a recovery EFI application for the Omarchy connected-reset prototype."""
+
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+BIN = Path(__file__).resolve().parent
+
+
+def create_image(iso, output, scratch):
+    # build-recovery verifies the signed bytes before extracting boot components.
+    bundle = scratch / "bundle"
+    subprocess.run([BIN / "build-recovery", "--iso", iso, "--output", bundle], check=True)
+    subprocess.run([BIN / "build-uki", "--bundle", bundle, "--output", output], check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--output", type=Path, help="prepare a new .efi file for inspection")
+    action.add_argument("--schedule", action="store_true", help="prepare and select recovery for the next boot of the dedicated test VM")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--version", help="Omarchy stable release to prepare (default: latest)")
+    source.add_argument("--iso", type=Path, help="local official x86 ISO with adjacent .sig")
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        parser.exit(1, "Run the builder as an ordinary user.\n")
+    try:
+        if args.schedule:
+            # Validate the guest before a potentially large download. The scheduler
+            # repeats these checks just before changing BootNext.
+            subprocess.run(["sudo", BIN / "schedule-recovery", "--check"], check=True)
+            parent = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy-cloud-reset"
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        else:
+            output = args.output.expanduser().absolute()
+            if output.suffix.lower() != ".efi" or os.path.lexists(output) or not output.parent.is_dir():
+                parser.error("--output must be a new .efi file in an existing directory")
+            parent = output.parent
+        if args.iso:
+            iso = args.iso.expanduser().absolute()
+        else:
+            prepare = [BIN / "prepare-installer"]
+            if args.version:
+                prepare.extend(["--version", args.version])
+            iso = Path(subprocess.check_output(prepare, text=True).strip())
+        with tempfile.TemporaryDirectory(prefix=".cloud-reset-", dir=parent) as temporary:
+            scratch = Path(temporary)
+            if args.schedule:
+                output = scratch / "recovery.efi"
+            create_image(iso, output, scratch)
+            if args.schedule:
+                subprocess.run(["sudo", BIN / "schedule-recovery", "--uki", output], check=True)
+            else:
+                print(f"Created {output}")
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"omarchy-cloud-reset: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

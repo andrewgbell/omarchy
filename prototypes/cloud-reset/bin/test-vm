@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Smoke-test connected reset with UEFI and a disposable QEMU guest."""
+
+import argparse
+import contextlib
+import http.server
+import os
+from pathlib import Path
+import selectors
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+BIN = Path(__file__).resolve().parent
+GIB = 1024**3
+LIVE_OK = b"OMARCHY_CLOUD_RESET_LIVE_OK"
+LIVE_FAILED = b"OMARCHY_CLOUD_RESET_LIVE_FAILED"
+VM_UUID = "04087d63-1df8-4018-bd1a-bd4ef98a66dd"
+TARGET_SERIAL = "omarchy-reset-test"
+
+
+class InstallerHTTP(http.server.BaseHTTPRequestHandler):
+    def serve_installer(self, body):
+        # BaseHTTPRequestHandler normalizes a leading double slash in self.path.
+        if self.requestline.split()[1] != "/installer.iso":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(self.server.image_size))
+        self.end_headers()
+        if body:
+            offset = 0
+            try:
+                while offset < self.server.image_size:
+                    with self.server.read_lock:
+                        if self.server.image_fd is None:
+                            return
+                        count = min(1024**2, self.server.image_size - offset)
+                        data = os.pread(self.server.image_fd, count, offset)
+                    if not data:
+                        return
+                    self.wfile.write(data)
+                    offset += len(data)
+                self.server.transferred.set()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                pass
+
+    def do_GET(self):
+        self.serve_installer(True)
+
+    def do_HEAD(self):
+        self.serve_installer(False)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@contextlib.contextmanager
+def image_server(image):
+    with image.open("rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or not info.st_size:
+            raise ValueError("expected a nonempty regular ISO file")
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), InstallerHTTP) as server:
+            server.read_lock = threading.Lock()
+            server.image_fd = source.fileno()
+            server.image_size = info.st_size
+            server.transferred = threading.Event()
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                yield server
+            finally:
+                server.shutdown()
+                worker.join()
+                with server.read_lock:
+                    server.image_fd = None
+
+
+def dependencies():
+    qemu = shutil.which("qemu-system-x86_64")
+    if not qemu:
+        raise ValueError("qemu-system-x86_64 is required (Arch package qemu-system-x86)")
+    for directory, code_name, vars_name in [
+        ("/usr/share/edk2/x64", "OVMF_CODE.4m.fd", "OVMF_VARS.4m.fd"),
+        ("/usr/share/OVMF", "OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
+        ("/usr/share/edk2/ovmf", "OVMF_CODE.fd", "OVMF_VARS.fd"),
+        ("/usr/share/OVMF", "OVMF_CODE.fd", "OVMF_VARS.fd"),
+    ]:
+        code = Path(directory, code_name)
+        variables = Path(directory, vars_name)
+        if code.is_file() and variables.is_file():
+            return qemu, code, variables
+    raise ValueError("x86_64 OVMF code and matching variables template are required (Arch package edk2-ovmf)")
+
+
+def blockfile(path):
+    return str(path).replace(",", ",,")
+
+
+def make_recovery_esp(bundle, esp, probe=False):
+    esp.mkdir(mode=0o700)
+    loader = esp / "EFI/BOOT/BOOTX64.EFI"
+    loader.parent.mkdir(parents=True)
+    command = [BIN / "build-uki", "--bundle", bundle, "--output", loader]
+    if probe:
+        command.append("--probe")
+    subprocess.run(command, check=True)
+    return loader
+
+
+def firmware_boot_args(esp):
+    # OVMF discovers the standard removable-media path on this temporary, read-only disk.
+    return [
+        "-drive", f"if=none,id=recovery_esp,format=raw,readonly=on,file=fat:16:{blockfile(esp)}",
+        "-device", "virtio-blk-pci,drive=recovery_esp,bootindex=1",
+    ]
+
+
+def qemu_command(qemu, code, variables, disk, esp, ram_gib, gui):
+    return [
+        qemu, "-no-user-config", "-nodefaults", "-machine", "q35,accel=kvm:tcg",
+        "-uuid", VM_UUID, "-smp", "2", "-m", f"{ram_gib}G",
+        "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={blockfile(code)}",
+        "-drive", f"if=pflash,unit=1,format=raw,file={blockfile(variables)}",
+        "-drive", f"if=none,id=target,format=raw,file={blockfile(disk)}",
+        "-device", f"virtio-blk-pci,drive=target,serial={TARGET_SERIAL},bootindex=2",
+        "-netdev", "user,id=recovery", "-device", "virtio-net-pci,netdev=recovery",
+        *firmware_boot_args(esp),
+        "-device", "VGA", "-display", "gtk" if gui else "none",
+        "-monitor", "none", "-serial", "stdio", "-no-reboot",
+    ]
+
+
+def wait_for_live(process, transferred, timeout):
+    deadline = time.monotonic() + timeout
+    pending = b""
+    tail = b""
+    reason = f"timed out after {timeout}s waiting for live installer userspace"
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while (left := deadline - time.monotonic()) > 0:
+            if not selector.select(left):
+                break
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                reason = "QEMU exited before live installer userspace reported success"
+                break
+            tail = (tail + chunk)[-2048:]
+            lines = (pending + chunk).split(b"\n")
+            pending = lines.pop()
+            for raw in lines:
+                line = raw.strip(b"\r")
+                if line == LIVE_OK:
+                    if not transferred.is_set():
+                        raise ValueError("guest reported success without receiving the complete ISO")
+                    return
+                if line.startswith((LIVE_FAILED, b"OMARCHY_CLOUD_RESET_FAILED")):
+                    raise ValueError(line.decode(errors="replace"))
+            if len(pending) > 65536:
+                raise ValueError("unexpected oversized serial line")
+    raise ValueError(f"{reason}\nLast guest output:\n{tail.decode(errors='replace')}")
+
+
+def boot(command, transferred, timeout):
+    with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+        try:
+            wait_for_live(process, transferred, timeout)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def run(args):
+    qemu, code, template = dependencies()
+    prepare = [BIN / "prepare-installer"]
+    if args.iso:
+        prepare.extend(["--verify-file", args.iso])
+    elif args.version:
+        prepare.extend(["--version", args.version])
+    image = Path(subprocess.check_output(prepare, text=True).strip())
+    if not image.is_absolute():
+        raise ValueError("prepare-installer did not return an absolute ISO path")
+    with tempfile.TemporaryDirectory(prefix="omarchy-recovery-vm-") as tmp, image_server(image) as server:
+        scratch = Path(tmp)
+        bundle = scratch / "recovery"
+        url = f"http://10.0.2.2:{server.server_port}/installer.iso"
+        subprocess.run([BIN / "build-recovery", "--iso", image, "--url", url, "--output", bundle], check=True)
+        esp = scratch / "esp"
+        make_recovery_esp(bundle, esp, probe=True)
+        variables = scratch / "vars.fd"
+        shutil.copyfile(template, variables)
+        disk = scratch / "disposable.raw"
+        with disk.open("xb") as guest_disk:
+            guest_disk.truncate(64 * GIB)
+        ram_gib = (server.image_size + GIB - 1) // GIB + 4
+        print(f"Booting disposable UEFI VM with {ram_gib} GiB RAM (timeout {args.timeout}s)...", file=sys.stderr)
+        boot(qemu_command(qemu, code, variables, disk, esp, ram_gib, args.gui), server.transferred, args.timeout)
+    print("Passed: the guest downloaded the complete ISO and reached verified Omarchy live installer userspace.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--version", help="use a specific stable release (default: latest)")
+    source.add_argument("--iso", type=Path, help="use a local release ISO with an adjacent .sig, also works offline")
+    parser.add_argument("--timeout", type=int, default=900, help="guest boot timeout in seconds (default: 900)")
+    parser.add_argument("--gui", action="store_true", help="show a local QEMU window while the smoke test runs")
+    args = parser.parse_args()
+    if args.timeout < 1:
+        parser.error("--timeout must be positive")
+    if os.geteuid() == 0:
+        parser.exit(1, "Run the VM smoke test as an ordinary user.\n")
+    try:
+        run(args)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"test-vm: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
